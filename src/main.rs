@@ -1,8 +1,10 @@
-use std::{path::PathBuf, fs, collections::{HashMap}, rc::Rc};
+use std::{path::PathBuf, fs, collections::{HashMap}, rc::Rc, fmt};
 use regex::Regex;
 
 use clap::Parser;
 use serde_json::{from_str, Value};
+use log::{debug, info, LevelFilter};
+use simple_logger::SimpleLogger;
 
 #[derive(Parser, Debug)]
 #[command(author = "Felix Descoteaux", version, about, long_about = None)]
@@ -17,6 +19,10 @@ struct Cli {
     /// The matcher to exclude
     #[arg(short, long, value_name = "MATCHER")]
     exclude: String,
+
+    /// Enable debug mode
+    #[arg(short, long, default_value_t = false)]
+    debug: bool,
 }
 
 #[derive(Debug)]
@@ -60,7 +66,7 @@ impl<'a> BlameResult<'a> {
                 .map(|v| v.duration)
                 .sum();
 
-        println!(
+        info!(
             "{}ms spent in blamed samples over {}ms ({:.1}%)",
             total_blamed_duration / 1000,
             self.profile.total_duration / 1000,
@@ -69,10 +75,16 @@ impl<'a> BlameResult<'a> {
     }
 }
 
-#[derive(Debug)]
 struct Frame {
     name: String,
     file: String,
+}
+
+
+impl fmt::Debug for Frame {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        fmt.write_str(&format!("{} -> {}", self.name, self.file))
+    }
 }
 
 impl Frame {
@@ -99,7 +111,7 @@ struct Profile {
     raw: Vec<String>,
     raw_timestamp_deltas: Vec<u64>,
     total_duration: u64,
-    total_weight: u64
+    total_weight: u64,
 }
 
 impl Profile {
@@ -145,7 +157,7 @@ impl Profile {
             raw,
             raw_timestamp_deltas,
             total_duration,
-            total_weight
+            total_weight,
         }
     }
 
@@ -171,15 +183,23 @@ impl Profile {
             sample.weight = weight;
 
             let mut blamed = false;
+            let mut ignored = true;
             for frame in &sample.stack {
                 if blamed && frame.matches(&self.exclude_matcher) {
+                    ignored = false;
                     blamed = false;
-                    break;
+                    debug!("- {:?}", frame);
                 }
+
                 if frame.matches(&self.blame_matcher) {
                     blamed = true;
+                    ignored = false;
+                    debug!("+ {:?}", frame)
+                } else if blamed {
+                    debug!("... {:?}", frame);
                 }
             }
+            if !ignored { debug!("{}\n", if blamed { "✅️" } else { "❌" } )}
 
             sample.blamed = blamed;
 
@@ -207,7 +227,11 @@ fn main() {
     let exclude_matcher = Regex::new(&cli.exclude)
         .expect("The exclude matcher is not a valid regular expression.");
 
-    let mut profile = Profile::new(
+    let level = if cli.debug { LevelFilter::Debug } else { LevelFilter::Info };
+
+    SimpleLogger::new().without_timestamps().with_level(level).init().unwrap();
+
+    let profile = Profile::new(
         json,
         blame_matcher,
         exclude_matcher,
