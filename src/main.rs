@@ -1,5 +1,5 @@
 use std::{path::PathBuf, fs, collections::{HashMap}, rc::Rc, fmt};
-use regex::Regex;
+use fancy_regex::Regex;
 
 use clap::Parser;
 use serde_json::{from_str, Value};
@@ -99,7 +99,7 @@ impl Frame {
     }
 
     fn matches(&self, matcher: &Regex) -> bool {
-        matcher.is_match(&self.name) || matcher.is_match(&self.file)
+        matcher.is_match(&self.name).unwrap() || matcher.is_match(&self.file).unwrap()
     }
 }
 
