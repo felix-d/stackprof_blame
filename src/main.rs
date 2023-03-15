@@ -1,5 +1,6 @@
 use std::{path::PathBuf, fs, collections::{HashMap}, rc::Rc, fmt};
 use fancy_regex::Regex;
+use std::collections::BTreeMap;
 
 use clap::Parser;
 use serde_json::{from_str, Value};
@@ -31,6 +32,7 @@ struct Sample {
     weight: u64,
     duration: u64,
     blamed: bool,
+    blamed_tail: Option<Rc<Frame>>,
 }
 
 impl Sample {
@@ -40,6 +42,7 @@ impl Sample {
             weight: 0,
             duration: 0,
             blamed: false,
+            blamed_tail: None,
         }
     }
 }
@@ -59,6 +62,11 @@ impl<'a> BlameResult<'a> {
     }
 
     fn print_report(&self) {
+        self.print_total_blamed_time();
+        self.print_top_blamed_frames();
+    }
+
+    fn print_total_blamed_time(&self) {
         let total_blamed_duration: u64 =
             self.samples
                 .iter()
@@ -72,6 +80,30 @@ impl<'a> BlameResult<'a> {
             self.profile.total_duration / 1000,
             total_blamed_duration as f64 / self.profile.total_duration as f64 * 100f64,
         )
+    }
+
+    fn print_top_blamed_frames(&self) {
+        let mut blamed_frames: HashMap<String, u64> = HashMap::new();
+
+        self.samples
+            .iter()
+            .filter(|v| v.blamed)
+            .for_each(|sample| {
+                blamed_frames
+                    .entry(sample.blamed_tail.as_ref().unwrap().name.clone())
+                    .and_modify(|v| { *v += sample.duration; })
+                    .or_insert(sample.duration);
+            });
+
+        let mut sorted_blamed_frames: Vec<(String, u64)> = blamed_frames.into_iter().collect();
+        sorted_blamed_frames.sort_by(|a, b| b.1.cmp(&a.1));
+
+        info!("");
+        info!("Top blamed frames:");
+        for v in sorted_blamed_frames {
+            info!("{:.1} - {}", v.1 as f64 / 1000f64, v.0);
+        }
+
     }
 }
 
@@ -184,24 +216,30 @@ impl Profile {
 
             let mut blamed = false;
             let mut ignored = true;
+            let mut previous_frame: Option<&Rc<Frame>> = None;
+            let mut blamed_tail: Option<Rc<Frame>> = None;
             for frame in &sample.stack {
                 if blamed && frame.matches(&self.exclude_matcher) {
+                    blamed_tail = previous_frame.map(|v| v.clone());
                     ignored = false;
                     blamed = false;
                     debug!("- {:?}", frame);
                 }
 
                 if frame.matches(&self.blame_matcher) {
+                    blamed_tail = Some(frame.clone());
                     blamed = true;
                     ignored = false;
                     debug!("+ {:?}", frame)
                 } else if blamed {
                     debug!("... {:?}", frame);
                 }
+                previous_frame = Some(frame);
             }
             if !ignored { debug!("{}\n", if blamed { "✅️" } else { "❌" } )}
 
             sample.blamed = blamed;
+            sample.blamed_tail = blamed_tail;
 
             result.samples.push(sample);
 
