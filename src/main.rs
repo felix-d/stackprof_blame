@@ -1,280 +1,275 @@
-use std::{path::PathBuf, fs, collections::{HashMap}, rc::Rc, fmt};
-use fancy_regex::Regex;
-use std::collections::BTreeMap;
+mod profile;
 
-use clap::Parser;
-use serde_json::{from_str, Value};
-use log::{debug, info, LevelFilter};
-use simple_logger::SimpleLogger;
+use bytes::Bytes;
+use flate2::read::GzDecoder;
+use profile::{Location, Profile};
+use prost::Message;
+use regex::Regex;
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::{self, BufReader, Read},
+    path::PathBuf,
+};
+use structopt::StructOpt;
 
-#[derive(Parser, Debug)]
-#[command(author = "Felix Descoteaux", version, about, long_about = None)]
-struct Cli {
-    /// The path of the Stackprof profile.
-    profile_path: PathBuf,
+/// pprof_blame - A tool for analyzing pprof profiles with call stack relationships
+///
+/// This utility processes pprof profile files and filters samples based on the
+/// relationships between functions in the call stack. It uses three patterns:
+///
+/// - Blame: The primary function pattern to match in the stack
+/// - Parent: Function pattern that must appear as an ancestor of the blame function
+/// - Exclude: Function pattern that, if present, will exclude the sample
+///
+/// For each sample, it checks whether:
+/// 1. A function matching the blame pattern exists
+/// 2. A function matching the parent pattern exists (if specified)
+/// 3. The blame function is called by the parent function
+/// 4. No function matching the exclude pattern is present
+///
+/// Usage:
+///   pprof_blame --file profile.pb.gz --blame "pattern" [--parent "pattern"] [--exclude "pattern"]
+///
+/// Output:
+///   - With parent: matched samples as percentage of parent samples
+///   - Without parent: matched samples as percentage of total samples
+#[derive(StructOpt, Debug)]
+struct Opt {
+    /// Path to the profile file (.pb.gz)
+    #[structopt(long)]
+    file: PathBuf,
 
-    /// The matcher for which to extract data.
-    #[arg(short, long, value_name = "MATCHER")]
+    /// Regex pattern for functions to blame
+    #[structopt(long)]
     blame: String,
 
-    /// The matcher to exclude
-    #[arg(short, long, value_name = "MATCHER")]
-    exclude: String,
+    /// Optional regex pattern for parent functions
+    #[structopt(long)]
+    parent: Option<String>,
 
-    /// Enable debug mode
-    #[arg(short, long, default_value_t = false)]
-    debug: bool,
+    /// Optional regex pattern for functions to exclude
+    #[structopt(long)]
+    exclude: Option<String>,
 }
 
+/// Result of analyzing a profile
 #[derive(Debug)]
-struct Sample {
-    stack: Vec<Rc<Frame>>,
-    weight: u64,
-    duration: u64,
-    blamed: bool,
-    blamed_tail: Option<Rc<Frame>>,
+struct AnalysisResults {
+    total_samples: usize,
+    total_value: i64,
+    blamed_samples: usize,
+    blamed_value: i64,
+    excluded_samples: usize,
+    excluded_value: i64,
+    parent_samples: usize,
+    parent_value: i64,
 }
 
-impl Sample {
+impl AnalysisResults {
     fn new() -> Self {
         Self {
-            stack: vec![],
-            weight: 0,
-            duration: 0,
-            blamed: false,
-            blamed_tail: None,
+            total_samples: 0,
+            total_value: 0,
+            blamed_samples: 0,
+            blamed_value: 0,
+            excluded_samples: 0,
+            excluded_value: 0,
+            parent_samples: 0,
+            parent_value: 0,
+        }
+    }
+
+    fn percentage(&self) -> f64 {
+        if self.parent_samples > 0 {
+            (self.blamed_value as f64 / self.parent_value as f64) * 100.0
+        } else if self.total_value > 0 {
+            (self.blamed_value as f64 / self.total_value as f64) * 100.0
+        } else {
+            0.0
+        }
+    }
+
+    fn print_summary(&self, has_parent: bool) {
+        if has_parent {
+            println!(
+                "{} blamed samples ({} ms) over {} parent samples ({} ms) ({:.2}%).",
+                self.blamed_samples,
+                self.blamed_value,
+                self.parent_samples,
+                self.parent_value,
+                self.percentage()
+            );
+        } else {
+            println!(
+                "{} blamed samples ({} ms) over {} total samples ({} ms) ({:.2}%).",
+                self.blamed_samples,
+                self.total_value,
+                self.total_samples,
+                self.total_value,
+                self.percentage()
+            );
+        }
+
+        if self.excluded_samples > 0 {
+            println!(
+                "{} samples ({} ms) were excluded.",
+                self.excluded_samples, self.excluded_value
+            );
         }
     }
 }
 
-#[derive(Debug)]
-struct BlameResult<'a> {
-    profile: &'a Profile,
-    samples: Vec<Sample>
+/// A wrapper around the profile string table for safer access
+struct StringTable<'a> {
+    table: &'a [String],
 }
 
-impl<'a> BlameResult<'a> {
-    fn new(profile: &'a Profile) -> Self {
-        Self {
-            profile,
-            samples: vec![]
+impl<'a> StringTable<'a> {
+    fn new(table: &'a [String]) -> Self {
+        Self { table }
+    }
+
+    fn get(&self, index: i64) -> &'a str {
+        if index < 0 || index as usize >= self.table.len() {
+            return "<invalid_index>";
         }
+        &self.table[index as usize]
     }
+}
 
-    fn print_report(&self) {
-        self.print_total_blamed_time();
-        self.print_top_blamed_frames();
-    }
+/// Loads and decodes a profile from a file
+fn load_profile(path: &PathBuf) -> io::Result<Profile> {
+    let file = File::open(path)?;
+    let mut decoder = GzDecoder::new(BufReader::new(file));
+    let mut buf = Vec::new();
+    decoder.read_to_end(&mut buf)?;
 
-    fn print_total_blamed_time(&self) {
-        let total_blamed_duration: u64 =
-            self.samples
-                .iter()
-                .filter(|v| v.blamed)
-                .map(|v| v.duration)
-                .sum();
+    Profile::decode(Bytes::from(buf)).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
 
-        info!(
-            "{}ms spent in blamed samples over {}ms ({:.1}%)",
-            total_blamed_duration / 1000,
-            self.profile.total_duration / 1000,
-            total_blamed_duration as f64 / self.profile.total_duration as f64 * 100f64,
-        )
-    }
+/// Extracts function names from a sample's stack trace
+fn extract_stack<'a>(
+    sample: &'a profile::Sample,
+    location_map: &'a HashMap<u64, &'a Location>,
+    function_map: &'a HashMap<u64, &'a str>,
+) -> Vec<&'a str> {
+    sample
+        .location_id
+        .iter()
+        .flat_map(|loc_id| {
+            location_map.get(loc_id).into_iter().flat_map(|loc| {
+                loc.line
+                    .iter()
+                    .filter_map(|line| function_map.get(&line.function_id).copied())
+            })
+        })
+        .collect()
+}
 
-    fn print_top_blamed_frames(&self) {
-        let mut blamed_frames: HashMap<String, u64> = HashMap::new();
+/// Analyzes a profile with given filter patterns
+fn analyze_profile(
+    profile: &Profile,
+    blame_re: &Regex,
+    parent_re: Option<&Regex>,
+    exclude_re: Option<&Regex>,
+) -> AnalysisResults {
+    // Create a more efficient string table accessor
+    let string_table = StringTable::new(&profile.string_table);
 
-        self.samples
+    // Build maps for faster lookups
+    let function_map: HashMap<u64, &str> = profile
+        .function
+        .iter()
+        .map(|f| (f.id, string_table.get(f.name)))
+        .collect();
+
+    let location_map: HashMap<u64, &Location> =
+        profile.location.iter().map(|l| (l.id, l)).collect();
+
+    let mut results = AnalysisResults::new();
+
+    // Process each sample
+    for sample in &profile.sample {
+        let stack = extract_stack(sample, &location_map, &function_map);
+
+        if stack.is_empty() {
+            continue;
+        }
+
+        results.total_samples += 1;
+        let value = sample.value.first().copied().unwrap_or(0);
+        results.total_value += value;
+
+        // First, check for parent frame if a parent pattern is specified
+        let parent_idx = parent_re.and_then(|pattern| {
+            let idx = stack.iter().position(|&name| pattern.is_match(name));
+
+            // Track all samples that match the parent pattern
+            if idx.is_some() {
+                results.parent_samples += 1;
+                results.parent_value += value;
+            }
+
+            idx
+        });
+
+        // Skip processing if parent pattern specified but not found
+        if parent_re.is_some() && parent_idx.is_none() {
+            continue;
+        }
+
+        // Determine search range for blame frame
+        let search_range = if let Some(p_idx) = parent_idx {
+            // Only search frames that are ancestors of parent (before parent in stack)
+            &stack[..p_idx]
+        } else {
+            // Search entire stack when no parent specified
+            &stack[..]
+        };
+
+        // Look for blame frame in the determined search range
+        let blame_idx = search_range
             .iter()
-            .filter(|v| v.blamed)
-            .for_each(|sample| {
-                blamed_frames
-                    .entry(sample.blamed_tail.as_ref().unwrap().name.clone())
-                    .and_modify(|v| { *v += sample.duration; })
-                    .or_insert(sample.duration);
-            });
+            .position(|&name| blame_re.is_match(name));
 
-        let mut sorted_blamed_frames: Vec<(String, u64)> = blamed_frames.into_iter().collect();
-        sorted_blamed_frames.sort_by(|a, b| b.1.cmp(&a.1));
+        if let Some(blame_idx) = blame_idx {
+            // Check for exclusions if an exclude pattern is specified
+            let has_exclude = exclude_re
+                .map(|pattern| {
+                    // Only check frames before the blame frame
+                    search_range[..blame_idx]
+                        .iter()
+                        .any(|&name| pattern.is_match(name))
+                })
+                .unwrap_or(false);
 
-        info!("");
-        info!("Top blamed frames:");
-        for v in sorted_blamed_frames {
-            info!("{:.1} - {}", v.1 as f64 / 1000f64, v.0);
-        }
-
-    }
-}
-
-struct Frame {
-    name: String,
-    file: String,
-}
-
-
-impl fmt::Debug for Frame {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        fmt.write_str(&format!("{} -> {}", self.name, self.file))
-    }
-}
-
-impl Frame {
-    fn from_json(json: Value) -> Frame {
-        let name = json["name"].as_str().unwrap();
-        let file = json["file"].as_str().unwrap();
-
-        Frame {
-          name: name.to_string(),
-          file: file.to_string(),
-        }
-    }
-
-    fn matches(&self, matcher: &Regex) -> bool {
-        matcher.is_match(&self.name).unwrap() || matcher.is_match(&self.file).unwrap()
-    }
-}
-
-#[derive(Debug)]
-struct Profile {
-    blame_matcher: Regex,
-    exclude_matcher: Regex,
-    frames: HashMap<String, Rc<Frame>>,
-    raw: Vec<String>,
-    raw_timestamp_deltas: Vec<u64>,
-    total_duration: u64,
-    total_weight: u64,
-}
-
-impl Profile {
-    fn new(json: Value, blame_matcher: Regex, exclude_matcher: Regex) -> Self {
-        let frames =
-            json["frames"]
-                .as_object()
-                .expect("The profile is not valid.")
-                .clone()
-                .into_iter()
-                .map(|(k, v)| (k, Rc::new(Frame::from_json(v))))
-                .collect();
-
-        let raw =
-            json["raw"]
-                .as_array()
-                .expect("The profile is not valid.")
-                .clone()
-                .into_iter()
-                .map(|v| v.as_u64().expect("The profile is not valid.").to_string())
-                .collect();
-
-        let raw_timestamp_deltas: Vec<u64> =
-            json["raw_timestamp_deltas"]
-                .as_array()
-                .expect("The profile is not valid.")
-                .clone()
-                .into_iter()
-                .map(|v| v.as_u64().expect("The profile is not valid."))
-                .collect();
-
-        let total_duration = raw_timestamp_deltas.iter().sum();
-
-        let total_weight =
-            json["samples"]
-                .as_u64()
-                .expect("The profile is not valid.");
-
-        Self {
-            frames,
-            blame_matcher,
-            exclude_matcher,
-            raw,
-            raw_timestamp_deltas,
-            total_duration,
-            total_weight,
-        }
-    }
-
-    fn blame(&self) -> BlameResult {
-        let mut result = BlameResult::new(self);
-        let mut i = 0;
-        let mut d: usize = 0;
-
-        while i < self.raw.len() {
-            let mut sample = Sample::new();
-            let stack_height = self.raw[i].parse::<usize>().unwrap();
-            i += 1;
-            for _ in 0..stack_height {
-                let frame_id: &String = &self.raw[i];
-                let frame = self.frames.get(frame_id).unwrap().clone();
-                sample.stack.push(frame);
-                i += 1;
+            // Count the sample appropriately
+            if has_exclude {
+                results.excluded_samples += 1;
+                results.excluded_value += value;
+            } else {
+                results.blamed_samples += 1;
+                results.blamed_value += value;
             }
-            let weight = self.raw[i].parse::<u64>().unwrap();
-            let duration: u64 = self.raw_timestamp_deltas[d..d + weight as usize].iter().sum();
-            sample.duration = duration;
-            d += weight as usize;
-            sample.weight = weight;
-
-            let mut blamed = false;
-            let mut ignored = true;
-            let mut previous_frame: Option<&Rc<Frame>> = None;
-            let mut blamed_tail: Option<Rc<Frame>> = None;
-            for frame in &sample.stack {
-                if blamed && frame.matches(&self.exclude_matcher) {
-                    blamed_tail = previous_frame.map(|v| v.clone());
-                    ignored = false;
-                    blamed = false;
-                    debug!("- {:?}", frame);
-                }
-
-                if frame.matches(&self.blame_matcher) {
-                    blamed_tail = Some(frame.clone());
-                    blamed = true;
-                    ignored = false;
-                    debug!("+ {:?}", frame)
-                } else if blamed {
-                    debug!("... {:?}", frame);
-                }
-                previous_frame = Some(frame);
-            }
-            if !ignored { debug!("{}\n", if blamed { "✅️" } else { "❌" } )}
-
-            sample.blamed = blamed;
-            sample.blamed_tail = blamed_tail;
-
-            result.samples.push(sample);
-
-            i += 1;
         }
-
-        result
     }
+
+    results
 }
 
-fn main() {
-    let cli = Cli::parse();
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let opt = Opt::from_args();
 
-    let profile_data = fs::read_to_string(cli.profile_path)
-      .expect("The file does not exist.");
+    let blame_re = Regex::new(&opt.blame)?;
+    let parent_re = opt.parent.as_ref().map(|s| Regex::new(s).unwrap());
+    let exclude_re = opt.exclude.as_ref().map(|s| Regex::new(s).unwrap());
 
-    let json: Value = from_str(&profile_data)
-      .expect("The profile is not valid json.");
+    let profile = load_profile(&opt.file)?;
 
-    let blame_matcher = Regex::new(&cli.blame)
-        .expect("The blame matcher is not a valid regular expression.");
+    let results = analyze_profile(&profile, &blame_re, parent_re.as_ref(), exclude_re.as_ref());
 
-    let exclude_matcher = Regex::new(&cli.exclude)
-        .expect("The exclude matcher is not a valid regular expression.");
+    results.print_summary(parent_re.is_some());
 
-    let level = if cli.debug { LevelFilter::Debug } else { LevelFilter::Info };
-
-    SimpleLogger::new().without_timestamps().with_level(level).init().unwrap();
-
-    let profile = Profile::new(
-        json,
-        blame_matcher,
-        exclude_matcher,
-    );
-
-    let result = profile.blame();
-    result.print_report();
+    Ok(())
 }
