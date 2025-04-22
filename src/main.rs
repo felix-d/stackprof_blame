@@ -64,6 +64,9 @@ struct AnalysisResults {
     excluded_value: i64,
     parent_samples: usize,
     parent_value: i64,
+    blamed_frames: HashMap<String, (usize, i64)>,
+    parent_frames: HashMap<String, (usize, i64)>,
+    excluded_frames: HashMap<String, (usize, i64)>,
 }
 
 impl AnalysisResults {
@@ -77,6 +80,9 @@ impl AnalysisResults {
             excluded_value: 0,
             parent_samples: 0,
             parent_value: 0,
+            blamed_frames: HashMap::new(),
+            parent_frames: HashMap::new(),
+            excluded_frames: HashMap::new(),
         }
     }
 
@@ -121,6 +127,27 @@ impl AnalysisResults {
                 "{} samples ({} ms) were excluded.",
                 self.excluded_samples, excluded_value_ms
             );
+        }
+
+        if !self.blamed_frames.is_empty() {
+            println!("\nBlamed Frames:");
+            for (method, (count, value)) in &self.blamed_frames {
+                println!("{}: {} samples, {} ms", method, count, value / 1_000_000);
+            }
+        }
+
+        if has_parent && !self.parent_frames.is_empty() {
+            println!("\nParent Frames:");
+            for (method, (count, value)) in &self.parent_frames {
+                println!("{}: {} samples, {} ms", method, count, value / 1_000_000);
+            }
+        }
+
+        if !self.excluded_frames.is_empty() {
+            println!("\nExcluded Frames:");
+            for (method, (count, value)) in &self.excluded_frames {
+                println!("{}: {} samples, {} ms", method, count, value / 1_000_000);
+            }
         }
     }
 }
@@ -211,9 +238,13 @@ fn analyze_profile(
             let idx = stack.iter().position(|&name| pattern.is_match(name));
 
             // Track all samples that match the parent pattern
-            if idx.is_some() {
+            if let Some(idx) = idx {
                 results.parent_samples += 1;
                 results.parent_value += value;
+                let method_name = stack[idx].to_string();
+                let entry = results.parent_frames.entry(method_name).or_insert((0, 0));
+                entry.0 += 1;
+                entry.1 += value;
             }
 
             idx
@@ -253,9 +284,17 @@ fn analyze_profile(
             if has_exclude {
                 results.excluded_samples += 1;
                 results.excluded_value += value;
+                let method_name = stack[blame_idx].to_string();
+                let entry = results.excluded_frames.entry(method_name).or_insert((0, 0));
+                entry.0 += 1;
+                entry.1 += value;
             } else {
                 results.blamed_samples += 1;
                 results.blamed_value += value;
+                let method_name = stack[blame_idx].to_string();
+                let entry = results.blamed_frames.entry(method_name).or_insert((0, 0));
+                entry.0 += 1;
+                entry.1 += value;
             }
         }
     }
