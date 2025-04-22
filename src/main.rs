@@ -91,22 +91,27 @@ impl AnalysisResults {
     }
 
     fn print_summary(&self, has_parent: bool) {
+        let blamed_value_ms = self.blamed_value / 1_000_000;
+        let parent_value_ms = self.parent_value / 1_000_000;
+        let total_value_ms = self.total_value / 1_000_000;
+        let excluded_value_ms = self.excluded_value / 1_000_000;
+
         if has_parent {
             println!(
                 "{} blamed samples ({} ms) over {} parent samples ({} ms) ({:.2}%).",
                 self.blamed_samples,
-                self.blamed_value,
+                blamed_value_ms,
                 self.parent_samples,
-                self.parent_value,
+                parent_value_ms,
                 self.percentage()
             );
         } else {
             println!(
                 "{} blamed samples ({} ms) over {} total samples ({} ms) ({:.2}%).",
                 self.blamed_samples,
-                self.total_value,
+                blamed_value_ms,
                 self.total_samples,
-                self.total_value,
+                total_value_ms,
                 self.percentage()
             );
         }
@@ -114,7 +119,7 @@ impl AnalysisResults {
         if self.excluded_samples > 0 {
             println!(
                 "{} samples ({} ms) were excluded.",
-                self.excluded_samples, self.excluded_value
+                self.excluded_samples, excluded_value_ms
             );
         }
     }
